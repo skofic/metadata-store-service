@@ -1,6 +1,6 @@
 {
     "name": "metadata-store-service",
-    "version": "0.0.0",
+    "version": "0.1.0",
     "description": "Database API gateway for metadata store",
     "engines": {
         "arangodb": "^3.0.0"

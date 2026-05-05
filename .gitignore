@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Editor — JetBrains
+.idea/
+
+# Editor — VS Code
+.vscode/
+
+# Editor — Vim/Emacs swap files
+*.swp
+*.swo
+*~
+
+# Node (in case npm is ever used for tooling)
+node_modules/
+npm-debug.log*
+
+# ArangoDB development artefacts
+# (the service is mounted directly from this directory;
+#  ArangoDB may write internal state files alongside the source)
+*.arangodbrc
