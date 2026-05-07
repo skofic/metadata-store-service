@@ -6,3 +6,4 @@ module.context.use(router);   // mount at the service's root (currently /dict)
 router.use('/term',   require('./routes/term'));     // term lookup + alias resolution
 router.use('/enum',   require('./routes/enum'));     // enumeration traversal
 router.use('/fields', require('./routes/fields'));   // field ordering via _predicate_field-of
+router.use('/blob',   require('./routes/blob'));     // blob fetch by _key
