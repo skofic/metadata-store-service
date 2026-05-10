@@ -2,13 +2,20 @@
 
 // Destructor. Runs on Foxx service uninstall.
 //
-// Drops every collection listed in lib/indexes.js (which removes their
-// indexes implicitly) and removes the custom analyzers. This is destructive:
-// uninstalling the service erases all term, edge, link, and blob data.
+// Drops the views first (they reference indexes), then the collections
+// (which removes their indexes implicitly), then the custom analyzers.
+// This is destructive: uninstalling the service erases all term, edge,
+// link, and blob data.
 
 const { db } = require('@arangodb');
 const analyzers = require('@arangodb/analyzers');
-const { collections, analyzers: analyzerDefs } = require('../lib/indexes');
+const { collections, analyzers: analyzerDefs, views } = require('../lib/indexes');
+
+for (const v of views) {
+    if (db._view(v.name)) {
+        db._dropView(v.name);
+    }
+}
 
 for (const c of collections) {
     if (db._collection(c.name)) {

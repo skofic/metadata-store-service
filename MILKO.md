@@ -39,16 +39,22 @@ queries are the only thing to rewrite; the routes and the UI stay put.
 
 ## Where indexes live
 
-`lib/indexes.js` exports three arrays — pure data, no execution:
+`lib/indexes.js` exports four arrays — pure data, no execution:
 
 - `collections` — `terms`, `edges`, `links`, `blobs` (bare names; shared with
   the loader and other tooling, no service-mount prefix).
 - `analyzers` — custom analyzers only. Built-ins (`identity`, `text_en`,
   `norm_en`) are not listed.
 - `indexes` — every inverted index, paired with its target collection.
+- `views` — `search-alias` views, one per inverted index. Required because
+  ArangoDB 3.12 community does not allow `SEARCH` directly on collections;
+  the view is a thin routing layer over the index (no data duplication).
+  Filter-style queries via `FILTER doc.f == v OPTIONS { indexHint }` work
+  directly on the collection without the view.
 
-`scripts/setup.js` reads this module and applies the definitions idempotently.
-`scripts/teardown.js` reads `collections` and `analyzers` and removes them.
+`scripts/setup.js` applies all four idempotently. `scripts/teardown.js` drops
+views first, then collections (which drops indexes implicitly), then the
+custom analyzers.
 
 ## Lifecycle
 
@@ -77,6 +83,7 @@ Existence checks are by name only — definitions are never compared:
 | Collection | `db._collection(name)` | skip | create (document or edge per `type`) |
 | Analyzer | `analyzers.analyzer(name)` | skip | `analyzers.save(...)` |
 | Index | `coll.indexes().find(i => i.name === ...)` | skip | `coll.ensureIndex(def)` |
+| View | `db._view(name)` | skip | `db._createView(name, type, props)` |
 
 This is an intentional design choice. Comparing definitions and patching them
 silently leads to surprise behaviour (an upgrade quietly rebuilds a 14k-row
@@ -93,28 +100,43 @@ collections (`db._drop(name)`).
 
 ## Inverted index design
 
-Three indexes on `terms`:
+Three indexes on `terms`, each fronted by a single-index `search-alias` view
+of the same name with a `v_` prefix:
 
-- `idx_code` — `_code.*` exact-match identifiers, plus `_gid` doubled with the
-  `delim_underscore` analyzer for segment search. Cached. `primarySort` on
-  `_code._gid`. `storedValues` cover the standard list view (gid, namespace,
-  English title, term roles).
-- `idx_info_eng` — multilingual `_info` content, English locale. `text_en`
-  tokenisation across description bodies, plus `norm_en` on titles for
-  case/accent-insensitive sort and exact match. **Not cached** — the Markdown
-  body expansion will dominate index size and isn't RAM-friendly.
-- `idx_domn` — open categorical section. `includeAllFields: true` with
-  `identity` so new sub-properties pick up automatically. Cached.
+- `idx_code` / `v_idx_code` — `_code.*` exact-match identifiers, plus `_gid`
+  with the `delim_underscore` analyzer for segment search. Cached.
+  `primarySort` on `_code._gid`. `storedValues` cover the standard list
+  view (gid, namespace, English title, term roles).
+- `idx_info_eng` / `v_idx_info_eng` — multilingual `_info` content, English
+  locale. `text_en` tokenisation across description bodies. **Not cached** —
+  the Markdown body expansion will dominate index size and isn't RAM-friendly.
+- `idx_domn` / `v_idx_domn` — open categorical section. `includeAllFields:
+  true` with `identity` so new sub-properties pick up automatically. Cached.
 
 Per-language clones of `idx_info_eng` (`idx_info_ita`, `idx_info_fra`, …) get
-added in `lib/indexes.js` as translations land.
+added in `lib/indexes.js` as translations land — each gets its own paired
+search-alias view.
+
+### Field-path conventions
+
+- `searchField: true` is set at the index level for SEARCH support. Under
+  this mode, **do not use `[*]` array suffixes** — arrays are auto-expanded
+  by the index machinery. Writing `_code._aid` (no `[*]`) correctly indexes
+  every element of the alias-id array.
+- ArangoDB inverted indexes do not allow the same field path with multiple
+  analyzers in a single index. `_code._gid` therefore uses `delim_underscore`
+  only (segment search subsumes exact-string match because the search
+  expression is tokenised the same way). Exact-key lookups go through the
+  built-in `_key` primary index since `_key === _code._gid`.
 
 ## Tooling notes
 
 - Collection names are bare (`terms`, not `dict_terms`). The original
   `context.collectionName(...)` prefixing from the Foxx scaffold is intentionally
   not used — the loader and other workflow tools assume bare names.
-- Inverted index `cache: true` is supported in recent ArangoDB versions; verify
-  the deployed version supports it before pushing changes that depend on it.
+- Inverted index `cache: true` is set on `idx_code` and `idx_domn`. Note
+  that the API response from `_api/index?collection=terms` does not echo the
+  `cache` field back even when set; check the server logs or arangosh to
+  confirm caching is actually applied.
 - The `delim_underscore` analyzer is only meaningful for `_code._gid`-style
   underscore-segmented identifiers. Don't apply it to natural-language fields.
