@@ -18,14 +18,20 @@ APP/
 │   ├── indexes.js          — collections, custom analyzers, inverted index defs
 │   └── queries.js          — AQL query bodies (single source of truth)
 ├── routes/
-│   ├── term.js             — /term/:gid (with alias resolution), /term/bulk
-│   ├── enum.js             — /enum/:gid
-│   ├── fields.js           — /fields/:gid
-│   └── blob.js             — /blob/:key
+│   ├── term.js             — GET /term/:gid (heuristic alias-resolving), POST /term/bulk
+│   ├── enum.js             — GET /enum/:root (hierarchical BFS), POST /enum/check
+│   ├── fields.js           — GET /fields/:gid (object descriptor property order)
+│   ├── resolve.js          — POST /resolve/node (graph-aware alias resolution)
+│   └── blob.js             — GET /blob/:key
 ├── scripts/
 │   ├── setup.js            — runs on install + upgrade (idempotent)
 │   └── teardown.js         — runs on uninstall (destructive)
-└── test/                   — Foxx test files (extend over time)
+└── test/                   — one Mocha file per route
+    ├── term.js             — heuristic alias resolution, 404, bulk
+    ├── enum.js             — flat / sectioned / branch / bridge traversal + /check
+    ├── fields.js           — required+recommended ordering, 400, 404
+    ├── resolve.js          — graph-aware alias resolution, null for not-in-graph
+    └── blob.js             — known blob, 404
 ```
 
 ## Where queries live
@@ -36,6 +42,88 @@ that returns whatever the route needs, then expose it through a route.
 
 This makes the API surface portable — if we ever migrate off ArangoDB, the
 queries are the only thing to rewrite; the routes and the UI stay put.
+
+## Route catalogue
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET    | `/term/:gid`                                | Fetch a term; heuristic alias resolution via missing `_info`/`_data` |
+| POST   | `/term/bulk`                                | Fetch many terms in one request |
+| GET    | `/enum/:root?branch=&levels=&direction=&shape=` | BFS-traverse an enumeration hierarchy; bridge-of is transparent; `shape=compact` returns gids only |
+| POST   | `/enum/check`                               | Bulk membership check for the validation framework |
+| POST   | `/resolve/node`                             | Graph-aware alias resolution — canonical term for a target in a graph |
+| GET    | `/fields/:gid`                              | Property order of an object descriptor |
+| GET    | `/blob/:key`                                | Fetch a blob document |
+
+### Edge-direction parameter
+
+Every edge-aware endpoint takes a `direction` parameter — `"inbound"` (default,
+many-to-one) or `"outbound"` (one-to-many). Inbound is correct for every graph
+currently in the dictionary; the parameter is in place for future graphs whose
+roots sit at the `_from` side. It flips two things consistently in the
+underlying query: the AQL `INBOUND`/`OUTBOUND` keyword, and which end of an
+edge (`_from` vs `_to`) is treated as the "node" vs the "root/parent".
+
+### `/enum/:root` (hierarchical traversal)
+
+There is intentionally no "list every element of an enumeration" endpoint —
+returning all ~7k ISO 639-3 elements is not a real use case. Users always
+navigate enumerations through their hierarchy. The traversal:
+
+- INBOUND BFS from `branch` (defaults to `root`), bounded by `levels` (default 1).
+- Edges considered: `_predicate_enum-of` (options), `_predicate_section-of`
+  (display-only groups), `_predicate_bridge-of` (transparent passthrough).
+- Edge `_path` must contain the `root` handle.
+- Bridge-of edges are not returned and do not consume a level — `maxDepth` is
+  `levels + 1` to allow one bridge hop at the root.
+- The result preserves the option/section distinction via the `predicate` field.
+- `parent` is the closest visible (non-bridge) ancestor handle, so consumers
+  can rebuild a tree even when the immediate graph parent is a bridge node.
+- `shape=full` (default) embeds the full term document on each row; `shape=compact`
+  replaces it with the bare `gid`, ~50× smaller payload. Use compact for large
+  leaf sets (e.g. `branch=ISO_639_type_L` is 7k languages) and fetch full term
+  details on demand via `/term/:gid` for whatever the user selects.
+
+### `/enum/check` (membership)
+
+`POST { terms: [...], roots: [...] }` → `{ <term>: [<root>, ...] }`. For every
+combination of input term and input root, the query finds at least one edge
+with `_from == terms/<term>`, `_predicate == _predicate_enum-of`, and
+`terms/<root> IN _path`. No alias resolution — callers canonicalise first.
+
+### `/resolve/node` (graph-aware alias resolution)
+
+The principled counterpart to `/term/:gid`'s heuristic alias detection. Given
+a `root` and `target`, the algorithm:
+
+1. Looks for an edge in the `root` graph touching `target` at the leaf end
+   (`_from` for inbound, `_to` for outbound) whose predicate is the functional
+   one (`_predicate_enum-of` by default) or one of the configured traversal
+   predicates (`_predicate_section-of`, `_predicate_bridge-of` by default).
+2. If the seed edge is functional, the target is already canonical — returns
+   the target's document.
+3. Otherwise the target is a section or bridge node; traverses from the
+   target in the same direction, walking through allowed predicates until a
+   functional-predicate edge surfaces the canonical vertex.
+
+Use this before the classical enum-membership validator runs — e.g. a value
+arriving as `ISO_639_1_en` resolves to `ISO_639_3_eng`, which is what
+`/enum/check` will then test against the `ISO_639_1` root.
+
+`/term/:gid`'s heuristic resolution stays for the common path (single edge
+lookup, no graph context). Use `/resolve/node` when graph membership matters
+or when the heuristic might misfire on a term that legitimately lacks
+`_info`/`_data`.
+
+### `/fields/:gid` (object property order)
+
+Reads `term._data._object._open` or `._closed`, returns `_required` (flattened
+in declaration order, including nested `_selection` arrays used by pipeline
+selectors) followed by `_recommended`. Deduplicates on `_gid`. Returns 404 if
+the term is missing, 400 if it is not an object descriptor, and `[]` if it has
+no schema body or empty `_required`/`_recommended`. The historical
+`_predicate_field-of` edge-driven implementation has been retired in favour of
+reading directly from the term.
 
 ## Where indexes live
 
@@ -128,6 +216,27 @@ search-alias view.
   only (segment search subsumes exact-string match because the search
   expression is tokenised the same way). Exact-key lookups go through the
   built-in `_key` primary index since `_key === _code._gid`.
+
+## Running the tests
+
+The Foxx test files live under `APP/test/` and are auto-discovered through the
+`"tests": "test/**/*.js"` field in `manifest.json`. They are read-only against
+the live database and assume **core + standards + ISO** data is loaded — `_code`,
+`_type_scalar`, `_lid`, and the ISO 639 graphs (`ISO_639_3_eng`,
+`ISO_639_1_en` alias, `ISO_639_scope_I` section) are used as fixtures.
+
+Run from the ArangoDB web UI: **Services → dict → Tests**.
+
+Or via the HTTP API:
+
+```bash
+curl -sS -u zettlab:Zibibbo -X POST -H "Content-Type: application/json" \
+  "http://localhost:8529/_db/metadata/_api/foxx/tests?mount=/dict"
+```
+
+If a test fails because the expected term/edge isn't in the database, the
+fixture data hasn't been fully loaded — re-run the loader for `data/core/`,
+`data/standards/`, and `data/ISO/`.
 
 ## Tooling notes
 

@@ -5,19 +5,28 @@ const { getFields } = require('../lib/queries');
 const router = createRouter();
 
 // GET /fields/:gid
-// Works at any level of the field hierarchy:
-//   _term  → sections (_code, _info, _data, _domn, _prop)
-//   _edge  → top-level edge properties (_from, _predicate, _to, …)
-//   _code  → code properties (_nid, _lid, _gid, …)
-//   _info  → info properties (_title, _definition, …)
-// The _order values come from _path_data on each _predicate_field-of edge
-// and reproduce the canonical ordering enforced by assign-roles/JSONWriter.
+// Returns the canonical property order for an object descriptor.
+//
+// Source: the term's own _data._object._open or ._closed body. _required
+// entries are flattened (their _selection arrays — possibly nested for
+// pipeline selectors like _range) in declaration order, then _recommended
+// entries are appended. Properties are deduplicated on _gid; first
+// occurrence wins, so a required property is never re-emitted as recommended.
+//
+// Status semantics:
+//   404 — no term with this _gid
+//   400 — term exists but is not an object descriptor (no _data._object)
+//   200 + []                    — object descriptor with no schema body
+//   200 + [{ gid, required }]   — ordered list
 router.get('/:gid', function (req, res) {
-    res.json(getFields(req.pathParams.gid));
+    const out = getFields(req.pathParams.gid);
+    if (out && out.error === 'not-found')  { res.throw(404, 'Term not found');                 }
+    if (out && out.error === 'not-object') { res.throw(400, 'Term is not an object descriptor'); }
+    res.json(out);
 })
-.pathParam('gid', joi.string().required(), 'Record type or section _gid (e.g. _term, _code, _info)')
-.response(['application/json'], 'Ordered array of { gid, handle, order }')
-.summary('Get ordered field list for a record type or section')
-.description('Returns field descriptors sorted by _order, derived from _predicate_field-of edges pointing to the given term.');
+.pathParam('gid', joi.string().required(), 'Object-descriptor term _gid')
+.response(['application/json'], 'Array of { gid, required } in declaration order')
+.summary('Get ordered field list for an object descriptor')
+.description('Returns the canonical property order for an object descriptor, drawn from the term\'s _data._object._open or _closed body: _required entries first (flattened, in order), then _recommended entries. Properties are deduplicated on _gid.');
 
 module.exports = router;
